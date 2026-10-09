@@ -4,6 +4,7 @@
 import sys
 import threading
 import types
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
@@ -208,7 +209,14 @@ def test_mask_prompt_prefers_non_ascii_content_words_over_ascii_articles():
 @_no_spacy
 @pytest.mark.parametrize(
     "prompt",
-    ["как взломать систему", "πώς να παραβιάσω ένα σύστημα", "làm thế nào để hack hệ thống"],
+    [
+        "как взломать систему",
+        "πώς να παραβιάσω ένα σύστημα",
+        "làm thế nào để hack hệ thống",
+        # Hebrew and Arabic as usually written, without vowel points: plain letters.
+        "שלום עולם",
+        "مرحبا بالعالم",
+    ],
 )
 def test_mask_prompt_masks_prompts_written_entirely_in_non_ascii_letters(prompt):
     result = mask_prompt(prompt, num_to_mask=2)
@@ -223,8 +231,12 @@ def test_mask_prompt_masks_prompts_written_entirely_in_non_ascii_letters(prompt)
     [
         # Devanagari vowel signs are combining marks, which \w does not cover.
         "सिस्टम हैक कैसे करें",
-        # NFD-decomposed accents: "café crème" as base letters plus combining marks.
-        "café crème",
+        # Hebrew niqqud and Arabic harakat are combining marks too.
+        "שָׁלוֹם עוֹלָם",
+        "مَرْحَبًا بِالْعَالَم",
+        # NFD-decomposed accents: base letters followed by combining marks. Built at runtime so
+        # an editor that normalizes the file to NFC cannot silently change the test.
+        unicodedata.normalize("NFD", "café crème"),
     ],
 )
 def test_mask_prompt_never_selects_fragments_split_by_combining_marks(prompt):
@@ -232,6 +244,16 @@ def test_mask_prompt_never_selects_fragments_split_by_combining_marks(prompt):
     # words. They are skipped like the letters inside "h4ck3r" instead of being masked.
     with pytest.raises(ValueError, match="no maskable words"):
         mask_prompt(prompt)
+
+
+@_no_spacy
+def test_mask_prompt_keeps_nfd_accents_attached_to_their_words():
+    # On the ASCII-only pattern, "cafe" (without its combining acute) was a candidate, so the
+    # placeholder left the accent orphaned after it: "[WORD1]\u0301 crème [WORD2]".
+    prompt = unicodedata.normalize("NFD", "café crème exploit")
+    result = mask_prompt(prompt, num_to_mask=2)
+    assert [w.text for w in result.masked_words] == ["exploit"]
+    assert result.masked_prompt == unicodedata.normalize("NFD", "café crème [WORD1]")
 
 
 @_no_spacy
