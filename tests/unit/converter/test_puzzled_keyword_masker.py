@@ -263,6 +263,68 @@ def test_mask_prompt_masks_whole_words_next_to_text_with_combining_marks():
     assert result.masked_prompt == "[WORD1] सिस्टम [WORD2]"
 
 
+@_no_spacy
+@pytest.mark.parametrize("prompt", ["abc²", "² ¼", "x¼ y³"])
+def test_mask_prompt_never_selects_tokens_with_non_decimal_numbers(prompt):
+    # "²" and "¼" are word characters but not decimal digits, so [^\W\d_] admits them; a token
+    # is only a candidate if every character is a letter, as on the ASCII-only pattern.
+    with pytest.raises(ValueError, match="no maskable words"):
+        mask_prompt(prompt)
+
+
+@_no_spacy
+def test_mask_prompt_masks_words_next_to_tokens_with_non_decimal_numbers():
+    result = mask_prompt("reset the abc² password", num_to_mask=1)
+    assert [w.text for w in result.masked_words] == ["password"]
+    assert result.masked_prompt == "reset the abc² [WORD1]"
+
+
+_ACUTE = "\N{COMBINING ACUTE ACCENT}"
+
+
+@_no_spacy
+@pytest.mark.parametrize(
+    "prompt, expected",
+    [
+        (f"école école{_ACUTE}", f"[WORD1] école{_ACUTE}"),
+        (f"école{_ACUTE} école", f"école{_ACUTE} [WORD1]"),
+    ],
+)
+def test_mask_prompt_does_not_mask_a_skipped_fragment_with_the_same_spelling(prompt, expected):
+    # The second "école" is followed by a combining mark, so it is a fragment the scan skips.
+    # Replacement uses the same scan, so it must not mask it because the whole word "école"
+    # was selected elsewhere (which would leave the accent orphaned on the placeholder).
+    result = mask_prompt(prompt, num_to_mask=1)
+    assert [w.text for w in result.masked_words] == ["école"]
+    assert result.masked_prompt == expected
+
+
+@_no_spacy
+@pytest.mark.parametrize(
+    "prompt, expected",
+    [
+        ("ÉCOLE école", "[WORD1] [WORD1]"),
+        # Case-folding maps "ß" to "ss", so these are the same word.
+        ("Straße STRASSE", "[WORD1] [WORD1]"),
+    ],
+)
+def test_mask_prompt_masks_every_unicode_case_variant_of_a_chosen_word(prompt, expected):
+    result = mask_prompt(prompt, num_to_mask=1)
+    assert len(result.masked_words) == 1
+    assert result.masked_prompt == expected
+
+
+@_no_spacy
+def test_mask_prompt_keeps_case_variants_that_fold_to_different_words_apart():
+    # Turkish dotless "ı" and dotted "i" are different letters, and locale-independent case
+    # folding keeps them apart: "KIŞ" folds to "kiş", "kış" to "kış". They are two candidate
+    # words, so masking one never looks up a placeholder for the other.
+    one = mask_prompt("KIŞ kış", num_to_mask=1)
+    assert one.masked_prompt == "[WORD1] kış"
+    both = mask_prompt("KIŞ kış", num_to_mask=2)
+    assert both.masked_prompt == "[WORD1] [WORD2]"
+
+
 # --- spaCy loader ----------------------------------------------------------
 
 

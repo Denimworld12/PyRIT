@@ -24,11 +24,11 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-# The one tokenizer used for both candidate selection and placeholder ordering (always
-# through ``_iter_words``). Requiring word boundaries keeps candidates to runs of letters
-# that can actually be matched again when masking, so a token embedded in an alphanumeric
-# blob (the "h" of "h4ck3r") is never selected and then silently dropped. ``[^\W\d_]`` is
-# any Unicode letter, so words such as "Schädlinge" or Cyrillic words are candidates too.
+# The one tokenizer used for candidate selection, placeholder ordering and replacement
+# (always through ``_iter_words``). Requiring word boundaries keeps candidates to whole
+# words, so a token embedded in an alphanumeric blob (the "h" of "h4ck3r") is never
+# selected. ``[^\W\d_]`` admits Unicode letters, so words such as "Schädlinge" or Cyrillic
+# words are candidates too; ``_iter_words`` then drops matches that are not all letters.
 _WORD_PATTERN = re.compile(r"\b[^\W\d_]+\b")
 
 
@@ -36,14 +36,35 @@ def _is_combining_mark(char: str) -> bool:
     return unicodedata.category(char).startswith("M")
 
 
+def _word_key(word: str) -> str:
+    """
+    Return the case-insensitive key that identifies a word.
+
+    Selection, deduplication, ordering and replacement all compare words through this key,
+    so two spellings are either the same masked word everywhere or different words
+    everywhere. For ASCII it equals ``str.lower``.
+
+    Args:
+        word (str): A word from the prompt or from the caller.
+
+    Returns:
+        str: The case-folded word.
+    """
+    return word.casefold()
+
+
 def _iter_words(prompt: str) -> Iterator[re.Match[str]]:
     """
     Yield the maskable words of ``prompt``.
 
-    ``\\w`` does not cover combining marks (Devanagari vowel signs, or the accents of
-    NFD-decomposed text), so ``\\b`` falls inside words that contain them. A match that
-    touches a combining mark is only a fragment of a word, so it is skipped, just like the
-    letters inside "h4ck3r".
+    ``[^\\W\\d_]`` still admits characters that are numeric without being decimal digits,
+    such as "²" or "¼", so a match is kept only if every character is a letter. "abc²" is
+    therefore rejected whole, like "h4ck3r", rather than becoming a candidate.
+
+    ``\\w`` does not cover combining marks (Devanagari vowel signs, Hebrew and Arabic vowel
+    points, or the accents of NFD-decomposed text), so ``\\b`` falls inside words that
+    contain them. A match that touches a combining mark is only a fragment of a word, so it
+    is skipped as well.
 
     Args:
         prompt (str): The prompt to scan.
@@ -52,6 +73,8 @@ def _iter_words(prompt: str) -> Iterator[re.Match[str]]:
         re.Match[str]: Each whole-word match, in order of appearance.
     """
     for match in _WORD_PATTERN.finditer(prompt):
+        if not match.group().isalpha():
+            continue
         start, end = match.span()
         if start > 0 and _is_combining_mark(prompt[start - 1]):
             continue
@@ -202,7 +225,7 @@ def _get_nlp() -> Any:
 
 def _pos_lookup(prompt: str) -> dict[str, str]:
     """
-    Map each alphabetic noun/verb (lowercased) in the prompt to its clue label.
+    Map each alphabetic noun/verb in the prompt (by ``_word_key``) to its clue label.
 
     Returns an empty mapping when spaCy is unavailable.
 
@@ -210,7 +233,7 @@ def _pos_lookup(prompt: str) -> dict[str, str]:
         prompt (str): The prompt to tag.
 
     Returns:
-        dict[str, str]: Lowercased word to part-of-speech label ("noun" or "verb").
+        dict[str, str]: Word key to part-of-speech label ("noun" or "verb").
     """
     nlp = _get_nlp()
     if nlp is None:
@@ -219,7 +242,7 @@ def _pos_lookup(prompt: str) -> dict[str, str]:
     for token in nlp(prompt):
         if token.is_alpha and token.pos_ in _MASKABLE_POS:
             # Keep the first tag seen for a given surface form.
-            lookup.setdefault(token.text.lower(), _MASKABLE_POS[token.pos_])
+            lookup.setdefault(_word_key(token.text), _MASKABLE_POS[token.pos_])
     return lookup
 
 
@@ -250,16 +273,16 @@ def _rank_candidates(
     seen: set[str] = set()
     unique: list[str] = []
     for token in tokens:
-        key = token.lower()
+        key = _word_key(token)
         if key not in seen:
             seen.add(key)
             unique.append(token)
 
-    essential_lower = {w.lower() for w in (essential_words or [])}
+    essential_keys = {_word_key(w) for w in (essential_words or [])}
 
     def tier(word: str) -> int:
-        key = word.lower()
-        if key in essential_lower:
+        key = _word_key(word)
+        if key in essential_keys:
             return 0
         if key in _ESSENTIAL_HARM_WORDS:
             return 1
@@ -269,7 +292,7 @@ def _rank_candidates(
             return 3
         return 4
 
-    return sorted(unique, key=lambda w: (tier(w), -len(w), w.lower()))
+    return sorted(unique, key=lambda w: (tier(w), -len(w), _word_key(w)))
 
 
 def mask_prompt(
@@ -310,25 +333,34 @@ def mask_prompt(
         return MaskResult(masked_prompt=prompt, masked_words=[])
 
     # Number placeholders by where each chosen word first appears (case-insensitively), so
-    # [WORD1] is the leftmost masked word. Candidates come from the same word-boundary scan,
-    # so every chosen word has an entry here.
+    # [WORD1] is the leftmost masked word. Candidates come from the same scan, so every
+    # chosen word has an entry here.
     first_index: dict[str, int] = {}
     for match in _iter_words(prompt):
-        first_index.setdefault(match.group().lower(), match.start())
-    ordered = sorted(chosen, key=lambda w: first_index[w.lower()])
+        first_index.setdefault(_word_key(match.group()), match.start())
+    ordered = sorted(chosen, key=lambda w: first_index[_word_key(w)])
 
     masked_words: list[MaskedWord] = []
     placeholders: dict[str, str] = {}
     for index, word in enumerate(ordered, start=1):
         placeholder = f"[WORD{index}]"
-        pos = pos_lookup.get(word.lower(), _GENERIC_POS)
+        pos = pos_lookup.get(_word_key(word), _GENERIC_POS)
         masked_words.append(MaskedWord(text=word, placeholder=placeholder, pos=pos))
-        placeholders[word.lower()] = placeholder
+        placeholders[_word_key(word)] = placeholder
 
-    # Replace every occurrence of every chosen word in one case-insensitive pass, so a word
-    # that recurs or appears in different casing is never left in cleartext, and a placeholder
-    # already inserted cannot be re-matched while masking the next word.
-    pattern = re.compile(r"\b(" + "|".join(re.escape(w) for w in ordered) + r")\b", re.IGNORECASE)
-    masked_prompt = pattern.sub(lambda m: placeholders[m.group(0).lower()], prompt)
+    # Replace the word spans of the same scan, looked up by the same key. Every occurrence of
+    # a chosen word is masked whatever its casing, a fragment the scan skipped (next to a
+    # combining mark) is never masked, and every replaced span has a placeholder. Building the
+    # result in one pass also means an inserted placeholder can never be matched again.
+    pieces: list[str] = []
+    last_end = 0
+    for match in _iter_words(prompt):
+        placeholder = placeholders.get(_word_key(match.group()))
+        if placeholder is None:
+            continue
+        pieces.append(prompt[last_end : match.start()])
+        pieces.append(placeholder)
+        last_end = match.end()
+    pieces.append(prompt[last_end:])
 
-    return MaskResult(masked_prompt=masked_prompt, masked_words=masked_words)
+    return MaskResult(masked_prompt="".join(pieces), masked_words=masked_words)

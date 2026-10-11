@@ -56,9 +56,29 @@ class PuzzleType(str, Enum):
         return self.value.replace("_", " ")
 
 
+def _upper_same_length(word: str) -> str:
+    """
+    Uppercase ``word`` one character at a time, without changing its length.
+
+    ``str.upper`` expands some letters ("ß" becomes "SS", "ﬁ" becomes "FI"), which would make
+    an encoded word longer than the "N-letter" clue the masker gives for it. A letter whose
+    uppercase form is more than one character is kept as it is.
+
+    Args:
+        word (str): The word to uppercase.
+
+    Returns:
+        str: The uppercased word, with the same number of characters as ``word``.
+    """
+    return "".join(upper if len(upper := char.upper()) == 1 else char for char in word)
+
+
 def _normalize(words: list[str]) -> list[str]:
     """
     Uppercase the words and strip surrounding whitespace.
+
+    Uppercasing keeps each word's length (see ``_upper_same_length``), so every puzzle
+    encodes exactly as many letters as the masked word's length clue states.
 
     Args:
         words (list[str]): The masked keywords to encode.
@@ -71,7 +91,7 @@ def _normalize(words: list[str]) -> list[str]:
     """
     if not words:
         raise ValueError("At least one word is required to build a puzzle.")
-    cleaned = [w.strip().upper() for w in words]
+    cleaned = [_upper_same_length(w.strip()) for w in words]
     if any(not w for w in cleaned):
         raise ValueError("Words must contain at least one non-whitespace character.")
     return cleaned
