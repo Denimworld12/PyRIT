@@ -32,8 +32,38 @@ logger = logging.getLogger(__name__)
 _WORD_PATTERN = re.compile(r"\b[^\W\d_]+\b")
 
 
+def _is_combining_mark(char: str) -> bool:
+    return unicodedata.category(char).startswith("M")
+
+
 def _is_word_continuation(char: str) -> bool:
-    return char in ("\u200c", "\u200d") or unicodedata.category(char).startswith("M")
+    return char in ("\u200c", "\u200d") or _is_combining_mark(char)
+
+
+def _letter_count(word: str) -> int:
+    """
+    Return the number of letters in ``word``, ignoring the characters that continue it.
+
+    A clue states how many letters a masked word has, so the marks that spell its vowels and
+    the joiners that shape it must not be counted: pointed "שָׁלוֹם" is a four-letter word
+    written with seven code points.
+
+    Args:
+        word (str): A word yielded by ``_iter_words``.
+
+    Returns:
+        int: The count of characters that are not word continuations.
+    """
+    return sum(1 for char in word if not _is_word_continuation(char))
+
+
+@dataclass(frozen=True)
+class _Word:
+    """A whole word of the prompt and the span it occupies."""
+
+    text: str
+    start: int
+    end: int
 
 
 def _word_key(word: str) -> str:
@@ -44,43 +74,63 @@ def _word_key(word: str) -> str:
     so two spellings are either the same masked word everywhere or different words
     everywhere. For ASCII it equals ``str.lower``.
 
+    Case folding alone is not stable across normalization forms: composed "café" and
+    decomposed "cafe\u0301" fold to different strings, which would make them two words and let
+    the alphabetical tie-break in ``_rank_candidates`` choose differently for the same prompt.
+    Normalizing first makes the key depend on the word rather than on how it was typed.
+
     Args:
         word (str): A word from the prompt or from the caller.
 
     Returns:
-        str: The case-folded word.
+        str: The case-folded word in composed form.
     """
-    return word.casefold()
+    return unicodedata.normalize("NFC", word).casefold()
 
 
-def _iter_words(prompt: str) -> Iterator[re.Match[str]]:
+def _iter_words(prompt: str) -> Iterator[_Word]:
     """
     Yield the maskable words of ``prompt``.
 
     ``[^\\W\\d_]`` still admits characters that are numeric without being decimal digits,
-    such as "²" or "¼", so a match is kept only if every character is a letter. "abc²" is
+    such as "²" or "¼", so a run is kept only if every character is a letter. "abc²" is
     therefore rejected whole, like "h4ck3r", rather than becoming a candidate.
 
     ``\\w`` does not cover combining marks (Devanagari vowel signs, Hebrew and Arabic vowel
     points, or the accents of NFD-decomposed text) or zero-width joiners and non-joiners.
-    These characters can continue a word even though ``\\b`` treats them as boundaries.
-    A match that touches one of them is only a fragment, so it is skipped as well.
+    These characters continue a word even though ``\\b`` treats them as boundaries, so the
+    pattern returns fragments. Runs separated by nothing but combining marks belong to one
+    word, so they are joined back together and trailing marks are taken with them: pointed
+    Hebrew and Arabic, Devanagari and NFD text are scanned as whole words.
+
+    A joiner is not part of the word it shapes, so a word that adjoins one is still only a
+    fragment and is skipped, as are the letters inside "h4ck3r".
 
     Args:
         prompt (str): The prompt to scan.
 
     Yields:
-        re.Match[str]: Each whole-word match, in order of appearance.
+        _Word: Each whole word, in order of appearance.
     """
+    spans: list[list[int]] = []
     for match in _WORD_PATTERN.finditer(prompt):
         if not match.group().isalpha():
             continue
         start, end = match.span()
+        gap = prompt[spans[-1][1] : start] if spans else ""
+        if gap and all(_is_combining_mark(char) for char in gap):
+            spans[-1][1] = end
+        else:
+            spans.append([start, end])
+
+    for start, end in spans:
+        while end < len(prompt) and _is_combining_mark(prompt[end]):
+            end += 1
         if start > 0 and _is_word_continuation(prompt[start - 1]):
             continue
         if end < len(prompt) and _is_word_continuation(prompt[end]):
             continue
-        yield match
+        yield _Word(text=prompt[start:end], start=start, end=end)
 
 
 # Part-of-speech label used when spaCy is unavailable or the word was caller-supplied.
@@ -163,7 +213,7 @@ class MaskedWord:
     @property
     def clue(self) -> str:
         """The deterministic clue for this word, e.g. ``"9-letter noun"``."""
-        return f"{len(self.text)}-letter {self.pos}"
+        return f"{_letter_count(self.text)}-letter {self.pos}"
 
 
 @dataclass(frozen=True)
@@ -269,7 +319,7 @@ def _rank_candidates(
     Returns:
         list[str]: Distinct candidate words (as they appear in the prompt) in priority order.
     """
-    tokens = [match.group() for match in _iter_words(prompt)]
+    tokens = [word.text for word in _iter_words(prompt)]
     seen: set[str] = set()
     unique: list[str] = []
     for token in tokens:
@@ -292,7 +342,7 @@ def _rank_candidates(
             return 3
         return 4
 
-    return sorted(unique, key=lambda w: (tier(w), -len(w), _word_key(w)))
+    return sorted(unique, key=lambda w: (tier(w), -_letter_count(w), _word_key(w)))
 
 
 def mask_prompt(
@@ -336,8 +386,8 @@ def mask_prompt(
     # [WORD1] is the leftmost masked word. Candidates come from the same scan, so every
     # chosen word has an entry here.
     first_index: dict[str, int] = {}
-    for match in _iter_words(prompt):
-        first_index.setdefault(_word_key(match.group()), match.start())
+    for word in _iter_words(prompt):
+        first_index.setdefault(_word_key(word.text), word.start)
     ordered = sorted(chosen, key=lambda w: first_index[_word_key(w)])
 
     masked_words: list[MaskedWord] = []
@@ -349,18 +399,17 @@ def mask_prompt(
         placeholders[_word_key(word)] = placeholder
 
     # Replace the word spans of the same scan, looked up by the same key. Every occurrence of
-    # a chosen word is masked whatever its casing, a fragment the scan skipped (next to a
-    # combining mark or joiner) is never masked, and every replaced span has a placeholder.
+    # a chosen word is masked whatever its casing, and every replaced span has a placeholder.
     # Building the result in one pass means an inserted placeholder can never be matched again.
     pieces: list[str] = []
     last_end = 0
-    for match in _iter_words(prompt):
-        placeholder = placeholders.get(_word_key(match.group()))
+    for word in _iter_words(prompt):
+        placeholder = placeholders.get(_word_key(word.text))
         if placeholder is None:
             continue
-        pieces.append(prompt[last_end : match.start()])
+        pieces.append(prompt[last_end : word.start])
         pieces.append(placeholder)
-        last_end = match.end()
+        last_end = word.end
     pieces.append(prompt[last_end:])
 
     return MaskResult(masked_prompt="".join(pieces), masked_words=masked_words)
