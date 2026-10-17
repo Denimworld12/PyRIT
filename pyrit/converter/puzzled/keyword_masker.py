@@ -15,46 +15,38 @@ selection; without it, keywords are chosen by length alone.
 """
 
 import logging
-import re
 import threading
 import unicodedata
 from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any
 
+import regex
+
+from pyrit.converter.puzzled._text import _is_combining_mark, _letter_units
+
 logger = logging.getLogger(__name__)
 
-# The one tokenizer used for candidate selection, placeholder ordering and replacement
-# (always through ``_iter_words``). Requiring word boundaries keeps candidates to whole
-# words, so a token embedded in an alphanumeric blob (the "h" of "h4ck3r") is never
-# selected. ``[^\W\d_]`` admits Unicode letters, so words such as "Schädlinge" or Cyrillic
-# words are candidates too; ``_iter_words`` then drops matches that are not all letters.
-_WORD_PATTERN = re.compile(r"\b[^\W\d_]+\b")
-
-
-def _is_combining_mark(char: str) -> bool:
-    return unicodedata.category(char).startswith("M")
-
-
-def _is_word_continuation(char: str) -> bool:
-    return char in ("\u200c", "\u200d") or _is_combining_mark(char)
+# Scan complete tokens before rejecting numbers, underscores, joiners, or leading marks.
+# Rejecting a whole run prevents a mark from exposing a maskable prefix of an invalid token.
+_WORD_PATTERN = regex.compile(r"[\p{L}\p{M}\p{N}_\u200c\u200d]+")
 
 
 def _letter_count(word: str) -> int:
     """
-    Return the number of letters in ``word``, ignoring the characters that continue it.
+    Return the number of letter units used by the puzzle builders.
 
-    A clue states how many letters a masked word has, so the marks that spell its vowels and
-    the joiners that shape it must not be counted: pointed "שָׁלוֹם" is a four-letter word
-    written with seven code points.
+    Combining marks stay attached to their letters, so pointed "שָׁלוֹם" has four units
+    despite being written with seven code points. Canonically equivalent spellings use
+    the same units.
 
     Args:
         word (str): A word yielded by ``_iter_words``.
 
     Returns:
-        int: The count of characters that are not word continuations.
+        int: The count of letters with their attached combining marks.
     """
-    return sum(1 for char in word if not _is_word_continuation(char))
+    return len(_letter_units(word))
 
 
 @dataclass(frozen=True)
@@ -77,7 +69,8 @@ def _word_key(word: str) -> str:
     Case folding alone is not stable across normalization forms: composed "café" and
     decomposed "cafe\u0301" fold to different strings, which would make them two words and let
     the alphabetical tie-break in ``_rank_candidates`` choose differently for the same prompt.
-    Normalizing first makes the key depend on the word rather than on how it was typed.
+    Normalize before folding to put marks in canonical order, and again afterward because
+    folding can produce decomposed text. This also keeps Greek case variants equivalent.
 
     Args:
         word (str): A word from the prompt or from the caller.
@@ -85,26 +78,18 @@ def _word_key(word: str) -> str:
     Returns:
         str: The case-folded word in composed form.
     """
-    return unicodedata.normalize("NFC", word).casefold()
+    return unicodedata.normalize("NFC", unicodedata.normalize("NFD", word).casefold())
 
 
 def _iter_words(prompt: str) -> Iterator[_Word]:
     """
     Yield the maskable words of ``prompt``.
 
-    ``[^\\W\\d_]`` still admits characters that are numeric without being decimal digits,
-    such as "²" or "¼", so a run is kept only if every character is a letter. "abc²" is
-    therefore rejected whole, like "h4ck3r", rather than becoming a candidate.
-
-    ``\\w`` does not cover combining marks (Devanagari vowel signs, Hebrew and Arabic vowel
-    points, or the accents of NFD-decomposed text) or zero-width joiners and non-joiners.
-    These characters continue a word even though ``\\b`` treats them as boundaries, so the
-    pattern returns fragments. Runs separated by nothing but combining marks belong to one
-    word, so they are joined back together and trailing marks are taken with them: pointed
-    Hebrew and Arabic, Devanagari and NFD text are scanned as whole words.
-
-    A joiner is not part of the word it shapes, so a word that adjoins one is still only a
-    fragment and is skipped, as are the letters inside "h4ck3r".
+    Scan maximal runs of letters, combining marks, numbers, underscores, and joiners.
+    Keep only runs that start with a letter and contain only letters and attached marks.
+    This accepts pointed scripts and NFD accents without exposing fragments of tokens
+    such as "h4ck3r", "abc²", or a marked word followed by a digit or underscore.
+    Words containing joiners remain unmaskable.
 
     Args:
         prompt (str): The prompt to scan.
@@ -112,25 +97,11 @@ def _iter_words(prompt: str) -> Iterator[_Word]:
     Yields:
         _Word: Each whole word, in order of appearance.
     """
-    spans: list[list[int]] = []
     for match in _WORD_PATTERN.finditer(prompt):
-        if not match.group().isalpha():
+        word = match.group()
+        if not word[0].isalpha() or not all(char.isalpha() or _is_combining_mark(char) for char in word):
             continue
-        start, end = match.span()
-        gap = prompt[spans[-1][1] : start] if spans else ""
-        if gap and all(_is_combining_mark(char) for char in gap):
-            spans[-1][1] = end
-        else:
-            spans.append([start, end])
-
-    for start, end in spans:
-        while end < len(prompt) and _is_combining_mark(prompt[end]):
-            end += 1
-        if start > 0 and _is_word_continuation(prompt[start - 1]):
-            continue
-        if end < len(prompt) and _is_word_continuation(prompt[end]):
-            continue
-        yield _Word(text=prompt[start:end], start=start, end=end)
+        yield _Word(text=word, start=match.start(), end=match.end())
 
 
 # Part-of-speech label used when spaCy is unavailable or the word was caller-supplied.

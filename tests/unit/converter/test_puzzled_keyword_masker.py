@@ -240,9 +240,7 @@ def test_mask_prompt_masks_prompts_written_entirely_in_non_ascii_letters(prompt)
     ],
 )
 def test_mask_prompt_masks_whole_words_written_with_combining_marks(prompt):
-    # \b falls inside these words, so the pattern returns the letter runs between the marks.
-    # Runs separated by nothing but combining marks are joined back into one word, so these
-    # prompts mask instead of raising "no maskable words".
+    # Combining marks belong to the whole word rather than acting as token boundaries.
     result = mask_prompt(prompt)
     assert result.masked_words
     for word in result.masked_words:
@@ -332,8 +330,8 @@ def test_mask_prompt_preserves_joined_words_beside_maskable_words(joiner: str) -
 @_no_spacy
 @pytest.mark.parametrize("prompt", ["abc²", "² ¼", "x¼ y³"])
 def test_mask_prompt_never_selects_tokens_with_non_decimal_numbers(prompt):
-    # "²" and "¼" are word characters but not decimal digits, so [^\W\d_] admits them; a token
-    # is only a candidate if every character is a letter, as on the ASCII-only pattern.
+    # Non-decimal numbers still belong to the same token. Reject the whole run rather than
+    # exposing any of its letters as candidates.
     with pytest.raises(ValueError, match="no maskable words"):
         mask_prompt(prompt)
 
@@ -343,6 +341,49 @@ def test_mask_prompt_masks_words_next_to_tokens_with_non_decimal_numbers():
     result = mask_prompt("reset the abc² password", num_to_mask=1)
     assert [w.text for w in result.masked_words] == ["password"]
     assert result.masked_prompt == "reset the abc² [WORD1]"
+
+
+@_no_spacy
+@pytest.mark.parametrize("form", ["NFC", "NFD"])
+@pytest.mark.parametrize(
+    "token",
+    [
+        "café2",
+        "café_name",
+        "caféabc2",
+        "caféabc²",
+        "café¼",
+        "2café",
+        "_café",
+        "²café",
+        "ab2\u0301café",
+        "\u0301café",
+        "café\u200dami",
+        "café\u200cami",
+    ],
+)
+def test_mask_prompt_rejects_complete_marked_nonword_tokens(*, form: str, token: str) -> None:
+    token = unicodedata.normalize(form, token)
+    with pytest.raises(ValueError, match="no maskable words"):
+        mask_prompt(token)
+
+    result = mask_prompt(f"garden {token} now", num_to_mask=3)
+    assert [word.text for word in result.masked_words] == ["garden", "now"]
+    assert result.masked_prompt == f"[WORD1] {token} [WORD2]"
+
+
+@_no_spacy
+@pytest.mark.parametrize("form", ["NFC", "NFD"])
+@pytest.mark.parametrize("word", ["μαΐου", "αΐδιος"])
+def test_mask_prompt_masks_every_canonical_greek_case_variant(*, form: str, word: str) -> None:
+    lower = unicodedata.normalize(form, word)
+    upper = unicodedata.normalize(form, word.upper())
+    result = mask_prompt(f"{lower} {upper}", num_to_mask=1)
+    assert len(result.masked_words) == 1
+    assert result.masked_prompt == "[WORD1] [WORD1]"
+
+    preferred = mask_prompt(f"garden {upper}", num_to_mask=1, essential_words=[lower])
+    assert preferred.masked_prompt == "garden [WORD1]"
 
 
 _ACUTE = "\N{COMBINING ACUTE ACCENT}"
